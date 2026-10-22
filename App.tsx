@@ -1,7 +1,8 @@
-import React, { useMemo, useState } from 'react';
-import { SafeAreaView, ScrollView, View, Text, TextInput, Pressable, StyleSheet, useWindowDimensions } from 'react-native';
-import { initialEvents, FestivalEvent, EventStatus } from './src/data';
+import React, { useMemo, useState, useEffect } from 'react';
+import { SafeAreaView, ScrollView, View, Text, TextInput, Pressable, StyleSheet, useWindowDimensions, ActivityIndicator } from 'react-native';
+import { FestivalEvent, EventStatus } from './src/data';
 import { theme as c } from './src/theme';
+import { eventService } from './src/services/eventService';
 
 type Page = 'dashboard' | 'events' | 'form';
 const stages = ['MAIN STAGE', 'GARDEN', 'WAREHOUSE', 'RIVER STAGE'];
@@ -32,7 +33,9 @@ export default function App() {
   const {width} = useWindowDimensions();
   const wide = width > 860;
   const [page,setPage] = useState<Page>('dashboard');
-  const [events,setEvents] = useState<FestivalEvent[]>(initialEvents);
+  const [events,setEvents] = useState<FestivalEvent[]>([]);
+  const [loading,setLoading] = useState(true);
+  const [isCloud,setIsCloud] = useState(eventService.isConnectedToCloud());
   const [search,setSearch] = useState('');
   const [filter,setFilter] = useState('TODOS');
   const [editing,setEditing] = useState<string | null>(null);
@@ -42,35 +45,111 @@ export default function App() {
   const [status,setStatus] = useState<EventStatus>('CONFIRMED');
   const [notice,setNotice] = useState('');
 
+  useEffect(() => {
+    let active = true;
+    const loadEvents = async () => {
+      try {
+        setLoading(true);
+        const data = await eventService.listEvents();
+        if (active) {
+          setEvents(data);
+          setIsCloud(eventService.isConnectedToCloud());
+        }
+      } catch (err) {
+        console.error('Error cargando eventos:', err);
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+
+    loadEvents();
+
+    const sub = eventService.subscribeToEvents((updatedList) => {
+      if (active) {
+        setEvents(updatedList);
+      }
+    });
+
+    return () => {
+      active = false;
+      sub.unsubscribe();
+    };
+  }, []);
+
   const filtered = useMemo(() => events.filter(e => (filter === 'TODOS' || e.space === filter) && (e.artist.toLowerCase().includes(search.toLowerCase()) || e.id.toLowerCase().includes(search.toLowerCase()))),[events,search,filter]);
   const openNew = () => {setEditing(null);setArtist('');setSpace(stages[0]);setTime('21:45');setStatus('CONFIRMED');setNotice('');setPage('form');};
   const openEdit = (e: FestivalEvent) => {setEditing(e.id);setArtist(e.artist);setSpace(e.space);setTime(e.time);setStatus(e.status);setNotice('');setPage('form');};
-  const save = () => {
+  const save = async () => {
     if(!artist.trim() || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)){setNotice('Introduce un artista y una hora válida (HH:MM).');return;}
-    if(editing){setEvents(v => v.map(e => e.id === editing ? {...e,artist:artist.trim().toUpperCase(),space,time,status} : e));setNotice('Evento actualizado (datos locales).');}
-    else {const id='EVT-'+Date.now().toString().slice(-7);setEvents(v=>[{id,artist:artist.trim().toUpperCase(),space,time,status},...v]);setNotice('Evento creado (datos locales).');}
-    setPage('events');
+    try {
+      if(editing){
+        const updated = await eventService.updateEvent({ id: editing, artist: artist.trim().toUpperCase(), space, time, status });
+        setEvents(v => v.map(e => e.id === editing ? updated : e));
+        setNotice(isCloud ? 'Evento actualizado en Amazon DynamoDB.' : 'Evento actualizado (modo local).');
+      } else {
+        const created = await eventService.createEvent({ artist: artist.trim().toUpperCase(), space, time, status });
+        setEvents(v => [created, ...v.filter(e => e.id !== created.id)]);
+        setNotice(isCloud ? 'Evento creado en Amazon DynamoDB.' : 'Evento creado (modo local).');
+      }
+      setPage('events');
+    } catch (err) {
+      setNotice('Error al guardar: ' + (err instanceof Error ? err.message : String(err)));
+    }
   };
-  const changeStatus = (id:string) => {setEvents(v=>v.map(e=>e.id===id?{...e,status:e.status==='CONFIRMED'?'DELAYED':e.status==='DELAYED'?'CANCELLED':'CONFIRMED'}:e));setNotice('Estado actualizado localmente.');};
-  const remove = (id:string) => {setEvents(v=>v.filter(e=>e.id!==id));setNotice('Evento eliminado localmente.');};
+  const changeStatus = async (id:string) => {
+    const current = events.find(e => e.id === id);
+    if (!current) return;
+    const nextStatus: EventStatus = current.status === 'CONFIRMED' ? 'DELAYED' : current.status === 'DELAYED' ? 'CANCELLED' : 'CONFIRMED';
+    try {
+      const updated = await eventService.updateEvent({ ...current, status: nextStatus });
+      setEvents(v => v.map(e => e.id === id ? updated : e));
+      setNotice(isCloud ? 'Estado actualizado en DynamoDB.' : 'Estado actualizado localmente.');
+    } catch (err) {
+      setNotice('Error al cambiar el estado en DynamoDB.');
+    }
+  };
+  const remove = async (id:string) => {
+    try {
+      await eventService.deleteEvent(id);
+      setEvents(v => v.filter(e => e.id !== id));
+      setNotice(isCloud ? 'Evento eliminado de DynamoDB.' : 'Evento eliminado localmente.');
+    } catch (err) {
+      setNotice('Error al eliminar en DynamoDB.');
+    }
+  };
   const confirmed = events.filter(e=>e.status==='CONFIRMED').length;
   const delayed = events.filter(e=>e.status==='DELAYED').length;
+
   return <SafeAreaView style={s.root}>
     <ScrollView contentContainerStyle={[s.container,wide&&{maxWidth:1160,alignSelf:'center',width:'100%'}]}>
       <View style={s.header}>
-        <View><Text style={s.brand}>FESTIVAL CONTROL<Text style={{color:c.pink}}> /</Text></Text><Text style={s.kicker}>LIVE OPERATIONS · EXPO WEB</Text></View>
-        <Text style={s.live}>● LIVE DEMO</Text>
+        <View><Text style={s.brand}>FESTIVAL CONTROL<Text style={{color:c.pink}}> /</Text></Text><Text style={s.kicker}>LIVE OPERATIONS · AWS BACKEND</Text></View>
+        <Text style={[s.live, !isCloud && {color: c.amber}]}>
+          {isCloud ? '● DYNAMODB CONECTADO' : '● MODO DEMO / LOCAL'}
+        </Text>
       </View>
       <View style={s.nav}>
         {([['dashboard','DASHBOARD'],['events','EVENTOS'],['form','+ NUEVO EVENTO']] as const).map(([key,label])=>
           <Pressable key={key} accessibilityRole="button" onPress={()=>key==='form'?openNew():setPage(key)} style={[s.navItem,page===key&&s.navActive]}><Text style={[s.navText,page===key&&{color:c.white}]}>{label}</Text></Pressable>)}
       </View>
       <View style={s.hero}>
-        <Text style={s.heroTag}>ZARAGOZA · FESTIVAL OPERATIONS</Text>
+        <Text style={s.heroTag}>AMAZON DYNAMODB · AWS AMPLIFY</Text>
         <Text style={[s.heroTitle,wide&&{fontSize:62}]}>THE NIGHT{ '\n' }IS YOURS.</Text>
-        <Text style={s.heroSub}>Gestiona la programación en tiempo real. Demo interactiva sin backend.</Text>
+        <Text style={s.heroSub}>
+          {isCloud 
+            ? 'Gestión de programación conectada a Amazon DynamoDB en tiempo real con AWS Amplify.' 
+            : 'Backend preparado para Amazon DynamoDB. Conectará automáticamente al desplegar en AWS Amplify.'}
+        </Text>
       </View>
-      {page==='dashboard' && <>
+
+      {loading && (
+        <View style={{paddingVertical: 30, alignItems: 'center'}}>
+          <ActivityIndicator size="large" color={c.pink} />
+          <Text style={[s.subtitle, {marginTop: 10}]}>Sincronizando con DynamoDB...</Text>
+        </View>
+      )}
+
+      {!loading && page==='dashboard' && <>
         <Text style={s.section}>PANEL DE CONTROL</Text>
         <View style={[s.stats,wide&&{flexDirection:'row'}]}>
           {[[String(events.length).padStart(2,'0'),'EVENTOS',c.white],[String(confirmed).padStart(2,'0'),'CONFIRMADOS',c.green],[String(delayed).padStart(2,'0'),'RETRASADOS',c.amber],['04','ESCENARIOS',c.pink]].map(([num,label,color])=><View key={label} style={[s.stat,wide&&{flex:1}]}><Text style={[s.statNumber,{color}]}>{num}</Text><Text style={s.statLabel}>{label}</Text></View>)}
@@ -79,9 +158,9 @@ export default function App() {
         {events.slice(0,3).map(e=><EventCard key={e.id} event={e} onEdit={()=>openEdit(e)} onStatus={()=>changeStatus(e.id)} onDelete={()=>remove(e.id)}/>)}
         <Action label="＋ CREAR NUEVO EVENTO" onPress={openNew}/>
       </>}
-      {page==='events' && <>
+      {!loading && page==='events' && <>
         <Text style={s.section}>PROGRAMACIÓN</Text>
-        <Text style={s.subtitle}>{filtered.length} eventos · filtra y administra el festival</Text>
+        <Text style={s.subtitle}>{filtered.length} eventos · datos persistentes en DynamoDB</Text>
         <TextInput accessibilityLabel="Buscar artista o ID" placeholder="Buscar artista o ID..." placeholderTextColor="#777" style={s.input} value={search} onChangeText={setSearch}/>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filters}>
           {['TODOS',...stages].map(v=><Pressable key={v} onPress={()=>setFilter(v)} style={[s.filter,filter===v&&s.filterActive]}><Text style={s.filterText}>{v}</Text></Pressable>)}
@@ -90,9 +169,9 @@ export default function App() {
         {filtered.map(e=><EventCard key={e.id} event={e} onEdit={()=>openEdit(e)} onStatus={()=>changeStatus(e.id)} onDelete={()=>remove(e.id)}/>)}
         <Action label="＋ NUEVO EVENTO" onPress={openNew}/>
       </>}
-      {page==='form' && <>
+      {!loading && page==='form' && <>
         <Text style={s.section}>{editing?'EDITAR EVENTO':'NUEVO EVENTO'}</Text>
-        <Text style={s.subtitle}>Completa los datos. Esta demo guarda los cambios sólo en memoria.</Text>
+        <Text style={s.subtitle}>Completa los datos para persistir el evento en DynamoDB.</Text>
         <View style={s.form}>
           <Text style={s.label}>ARTISTA *</Text>
           <TextInput accessibilityLabel="Artista" placeholder="Ej. TECHNO TITANS" placeholderTextColor="#777" style={s.input} value={artist} onChangeText={setArtist}/>
@@ -102,12 +181,17 @@ export default function App() {
           <TextInput accessibilityLabel="Hora" placeholder="21:45" placeholderTextColor="#777" style={s.input} value={time} onChangeText={setTime}/>
           <Text style={s.label}>ESTADO</Text>
           <View style={s.choices}>{statuses.map(v=><Pressable key={v} onPress={()=>setStatus(v)} style={[s.choice,status===v&&s.choiceActive]}><Text style={s.choiceText}>{v}</Text></Pressable>)}</View>
-          <Action label={editing?'GUARDAR CAMBIOS':'CREAR EVENTO'} onPress={save}/>
+          <Action label={editing?'GUARDAR EN DYNAMODB':'CREAR EN DYNAMODB'} onPress={save}/>
           <Action label="CANCELAR" secondary onPress={()=>setPage('events')}/>
         </View>
       </>}
       {!!notice && <Text accessibilityRole="alert" style={s.notice}>{notice}</Text>}
-      <View style={s.footer}><Text style={s.footerText}>FESTIVAL CONTROL · FRONTEND DEMO · REACT NATIVE + EXPO</Text><Text style={s.footerText}>NO BACKEND · NO HTTP · NO PERSISTENCIA</Text></View>
+      <View style={s.footer}>
+        <Text style={s.footerText}>FESTIVAL CONTROL · AWS AMPLIFY GEN 2 + AMAZON DYNAMODB + EXPO WEB</Text>
+        <Text style={s.footerText}>
+          {isCloud ? 'CONEXIÓN CLOUD ACTIVA · PERSISTENCIA COMPLETA' : 'MODO LOCAL · APROVISIONA CON "AMPX SANDBOX" O DESPLIEGA EN AMPLIFY CONSOLE'}
+        </Text>
+      </View>
     </ScrollView>
   </SafeAreaView>;
 }
