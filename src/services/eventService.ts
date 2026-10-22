@@ -1,67 +1,59 @@
-import { Amplify } from 'aws-amplify';
-import { generateClient } from 'aws-amplify/data';
-import type { Schema } from '../../amplify/data/resource';
-import outputs from '../../amplify_outputs.json';
 import { FestivalEvent, EventStatus, initialEvents } from '../data';
+import { API_CONFIG } from '../config';
 
-// Verificamos si Amplify tiene configuración válida desplegada
-export const isAmplifyConfigured = (): boolean => {
-  return Boolean(outputs && outputs.data && outputs.data.url && outputs.data.url.trim() !== '');
-};
-
-// Configurar Amplify sólo si existen endpoints reales
-if (isAmplifyConfigured()) {
-  try {
-    Amplify.configure(outputs);
-  } catch (err) {
-    console.warn('Advertencia configurando Amplify:', err);
-  }
-}
-
-// Cliente con tipado estricto inferido del backend de Amplify Gen 2 (AppSync + DynamoDB)
-const client = generateClient<Schema>();
-
-// Almacén en memoria como respaldo cuando no está conectado a la nube (demo local)
+// Almacén local en memoria cuando no hay API configurada
 let localCache: FestivalEvent[] = [...initialEvents];
 
+/**
+ * Servicio unificado para gestionar eventos con Amazon DynamoDB.
+ * Compatible con AWS Academy (vía API Gateway + Lambda + DynamoDB)
+ * y con modo local/demostración.
+ */
 export const eventService = {
   /**
-   * Indica si la app está operando en la nube con DynamoDB o en modo local.
+   * Comprueba si hay una conexión configurada con el backend en la nube.
    */
   isConnectedToCloud(): boolean {
-    return isAmplifyConfigured();
+    return Boolean(API_CONFIG.apiUrl && API_CONFIG.apiUrl.trim().startsWith('http'));
   },
 
   /**
-   * Obtiene todos los eventos desde DynamoDB (o desde la memoria local si no está conectado).
+   * Obtiene la lista de eventos desde DynamoDB a través del API Gateway.
    */
   async listEvents(): Promise<FestivalEvent[]> {
-    if (!isAmplifyConfigured()) {
+    if (!this.isConnectedToCloud()) {
       return [...localCache];
     }
 
     try {
-      const response = await client.models.FestivalEvent.list();
-      const items = (response.data || []) as unknown as FestivalEvent[];
+      const res = await fetch(API_CONFIG.apiUrl, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      if (!res.ok) {
+        throw new Error(`Error HTTP: ${res.status}`);
+      }
+
+      const items: FestivalEvent[] = await res.json();
 
       // Si la tabla de DynamoDB está vacía en el primer arranque, sembramos los eventos iniciales
       if (items.length === 0 && localCache.length > 0) {
         for (const item of localCache) {
-          await client.models.FestivalEvent.create({
+          await this.createEvent({
             artist: item.artist,
             space: item.space,
             time: item.time,
             status: item.status,
           });
         }
-        const seededResponse = await client.models.FestivalEvent.list();
-        return (seededResponse.data || []) as unknown as FestivalEvent[];
+        const seededRes = await fetch(API_CONFIG.apiUrl, { method: 'GET' });
+        return (await seededRes.json()) as FestivalEvent[];
       }
 
       return items;
     } catch (error) {
-      console.error('Error al listar eventos desde DynamoDB:', error);
-      // Fallback a caché local si la llamada a la nube falla
+      console.warn('No se pudo conectar con la API de DynamoDB, usando caché local:', error);
       return [...localCache];
     }
   },
@@ -70,7 +62,7 @@ export const eventService = {
    * Crea un nuevo evento en DynamoDB.
    */
   async createEvent(data: { artist: string; space: string; time: string; status: EventStatus }): Promise<FestivalEvent> {
-    if (!isAmplifyConfigured()) {
+    if (!this.isConnectedToCloud()) {
       const newEvent: FestivalEvent = {
         id: 'EVT-' + Date.now().toString().slice(-7),
         artist: data.artist.trim().toUpperCase(),
@@ -83,95 +75,95 @@ export const eventService = {
     }
 
     try {
-      const response = await client.models.FestivalEvent.create({
-        artist: data.artist.trim().toUpperCase(),
-        space: data.space,
-        time: data.time,
-        status: data.status,
+      const res = await fetch(API_CONFIG.apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
       });
 
-      if (!response.data) {
-        throw new Error('No se recibió confirmación de DynamoDB al crear el evento.');
+      if (!res.ok) {
+        throw new Error(`Error al crear en DynamoDB: ${res.status}`);
       }
 
-      return response.data as unknown as FestivalEvent;
+      const createdItem: FestivalEvent = await res.json();
+      return createdItem;
     } catch (error) {
-      console.error('Error al crear evento en DynamoDB:', error);
+      console.error('Error creando evento:', error);
       throw error;
     }
   },
 
   /**
-   * Actualiza un evento existente en DynamoDB.
+   * Actualiza un evento en DynamoDB.
    */
   async updateEvent(event: FestivalEvent): Promise<FestivalEvent> {
-    if (!isAmplifyConfigured()) {
+    if (!this.isConnectedToCloud()) {
       localCache = localCache.map((e) => (e.id === event.id ? { ...event } : e));
       return event;
     }
 
     try {
-      const response = await client.models.FestivalEvent.update({
-        id: event.id,
-        artist: event.artist.trim().toUpperCase(),
-        space: event.space,
-        time: event.time,
-        status: event.status,
+      const res = await fetch(API_CONFIG.apiUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(event),
       });
 
-      if (!response.data) {
-        throw new Error('No se recibió confirmación de DynamoDB al actualizar el evento.');
+      if (!res.ok) {
+        throw new Error(`Error al actualizar en DynamoDB: ${res.status}`);
       }
 
-      return response.data as unknown as FestivalEvent;
+      const updatedItem: FestivalEvent = await res.json();
+      return updatedItem;
     } catch (error) {
-      console.error('Error al actualizar evento en DynamoDB:', error);
+      console.error('Error actualizando evento:', error);
       throw error;
     }
   },
 
   /**
-   * Elimina un evento de DynamoDB por su ID.
+   * Elimina un evento de DynamoDB.
    */
   async deleteEvent(id: string): Promise<void> {
-    if (!isAmplifyConfigured()) {
+    if (!this.isConnectedToCloud()) {
       localCache = localCache.filter((e) => e.id !== id);
       return;
     }
 
     try {
-      await client.models.FestivalEvent.delete({ id });
+      const res = await fetch(`${API_CONFIG.apiUrl}?id=${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      if (!res.ok) {
+        throw new Error(`Error al eliminar de DynamoDB: ${res.status}`);
+      }
     } catch (error) {
-      console.error('Error al eliminar evento en DynamoDB:', error);
+      console.error('Error eliminando evento:', error);
       throw error;
     }
   },
 
   /**
-   * Suscribe en tiempo real a cambios en DynamoDB (AppSync subscription).
+   * Polling periódico para simular actualización en tiempo real cuando hay conexión activa.
    */
   subscribeToEvents(onUpdate: (events: FestivalEvent[]) => void): { unsubscribe: () => void } {
-    if (!isAmplifyConfigured()) {
+    if (!this.isConnectedToCloud()) {
       return { unsubscribe: () => {} };
     }
 
-    try {
-      const sub = client.models.FestivalEvent.observeQuery().subscribe({
-        next: ({ items }) => {
-          onUpdate(items as unknown as FestivalEvent[]);
-        },
-        error: (err) => {
-          console.warn('Error en suscripción en tiempo real de DynamoDB:', err);
-        },
-      });
+    const interval = setInterval(async () => {
+      try {
+        const events = await this.listEvents();
+        onUpdate(events);
+      } catch (err) {
+        // Silencio en polling de fondo
+      }
+    }, 5000);
 
-      return {
-        unsubscribe: () => sub.unsubscribe(),
-      };
-    } catch (err) {
-      console.warn('No se pudo inicializar la suscripción de DynamoDB:', err);
-      return { unsubscribe: () => {} };
-    }
+    return {
+      unsubscribe: () => clearInterval(interval),
+    };
   },
 };
-
